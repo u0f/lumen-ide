@@ -1,0 +1,6 @@
+{
+  "app": {
+    "appDirectoriesOverride": "$TEMP/lumen-e2e-profile",
+    "windows": [{ "label": "main", "title": "Lumen", "width": 1440, "height": 920, "minWidth": 900, "minHeight": 600, "backgroundColor": "#101216", "additionalBrowserArgs": "--remote-debugging-port=9333 --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection" }]
+  }
+}
