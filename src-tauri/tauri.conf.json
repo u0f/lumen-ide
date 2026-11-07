@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{ "label": "main", "title": "Lumen", "width": 1440, "height": 920, "minWidth": 900, "minHeight": 600, "backgroundColor": "#101216" }],
+    "windows": [{ "label": "main", "title": "Lumen", "width": 1440, "height": 920, "minWidth": 900, "minHeight": 600, "backgroundColor": "#101216", "decorations": false }],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost; worker-src 'self' blob:"
     }

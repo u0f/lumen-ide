@@ -1,8 +1,8 @@
-import { createElement, Keyboard, PanelsTopLeft, Save, TextCursorInput, Type, WandSparkles, Archive, ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronsDownUp, Circle, CircleAlert, CircleX, Columns2, Eye, File, FileCode2, FilePlus2, Files, Folder, FolderOpen, FolderPlus, GitBranch, GitCommitHorizontal, GitCompareArrows, GitFork, Globe, History, Info, List, Minus, MoreHorizontal, Play, Plus, RefreshCw, Replace, ReplaceAll, Search, Settings2, Tag, Terminal, Trash2, TriangleAlert, Undo2, X } from 'lucide';
+import { createElement, Keyboard, PanelsTopLeft, Save, TextCursorInput, Type, WandSparkles, Archive, ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronsDownUp, Circle, CircleAlert, CircleX, Columns2, Eye, File, FileCode2, FilePlus2, Files, Folder, FolderOpen, FolderPlus, GitBranch, GitCommitHorizontal, GitCompareArrows, GitFork, Container, Server, Square, Copy, Sparkles, Globe, History, Info, List, Minus, MoreHorizontal, Play, Plus, RefreshCw, Replace, ReplaceAll, Search, Settings2, Tag, Terminal, Trash2, TriangleAlert, Undo2, X } from 'lucide';
 import { t } from './i18n';
 import { fuzzy } from './types';
 
-const icons = { Keyboard, PanelsTopLeft, Save, TextCursorInput, Type, WandSparkles, Archive, ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronsDownUp, Circle, CircleAlert, CircleX, Columns2, Eye, File, FileCode2, FilePlus2, Files, Folder, FolderOpen, FolderPlus, GitBranch, GitCommitHorizontal, GitCompareArrows, GitFork, Globe, History, Info, List, Minus, MoreHorizontal, Play, Plus, RefreshCw, Replace, ReplaceAll, Search, Settings2, Tag, Terminal, Trash2, TriangleAlert, Undo2, X };
+const icons = { Keyboard, PanelsTopLeft, Save, TextCursorInput, Type, WandSparkles, Archive, ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronsDownUp, Circle, CircleAlert, CircleX, Columns2, Eye, File, FileCode2, FilePlus2, Files, Folder, FolderOpen, FolderPlus, GitBranch, GitCommitHorizontal, GitCompareArrows, GitFork, Container, Server, Square, Copy, Sparkles, Globe, History, Info, List, Minus, MoreHorizontal, Play, Plus, RefreshCw, Replace, ReplaceAll, Search, Settings2, Tag, Terminal, Trash2, TriangleAlert, Undo2, X };
 export type Icon = keyof typeof icons;
 export function icon(name: Icon, className = ''): SVGElement {
   const node = createElement(icons[name]);
@@ -37,13 +37,13 @@ export function toast(message: string, error = false) {
 export function report(error: unknown) { console.error(error); toast(String(error instanceof Error ? error.message : error), true); }
 
 interface Choice { label: string; value: string; danger?: boolean }
-interface DialogOptions { title: string; detail?: string; value?: string; placeholder?: string; confirm?: string; danger?: boolean; input?: boolean; choices?: Choice[] }
+interface DialogOptions { title: string; detail?: string; value?: string; placeholder?: string; confirm?: string; danger?: boolean; input?: boolean; password?: boolean; choices?: Choice[] }
 export function ask(options: DialogOptions): Promise<string | null> {
   return new Promise(resolve => {
     const dialog = raw('dialog', 'form-dialog'); const form = raw('form'); form.method = 'dialog';
     const heading = el('h2', '', options.title); heading.id = 'dialog-title'; dialog.setAttribute('aria-labelledby', heading.id); form.append(heading);
     if (options.detail) form.append(el('p', 'muted', options.detail));
-    const input = raw('input'); input.value = options.value ?? ''; input.placeholder = t(options.placeholder ?? ''); input.setAttribute('aria-label', t(options.title));
+    const input = raw('input'); if (options.password) input.type = 'password'; input.value = options.value ?? ''; input.placeholder = t(options.placeholder ?? ''); input.setAttribute('aria-label', t(options.title));
     const textual = options.input !== false && !options.choices;
     if (textual) form.append(input);
     const actions = raw('div', 'dialog-actions');

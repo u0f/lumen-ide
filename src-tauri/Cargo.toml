@@ -22,6 +22,7 @@ portable-pty = "0.9"
 ignore = "0.4"
 regex = "1"
 trash = "5"
+base64 = "0.23"
 
 [dev-dependencies]
 tempfile = "3"

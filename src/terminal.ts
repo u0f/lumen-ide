@@ -46,12 +46,12 @@ export class TerminalPanel {
   }
   hide() { this.visible = false; this.panel.classList.add('hidden'); this.onHide(); }
   toggle() { if (this.visible && this.tab === 'terminal') this.hide(); else { this.show(); if (!this.sessions.length) void this.create().catch(report); } }
-  async create() {
+  async create(name?: string) {
     if (this.starting) return;
     this.starting = true; const sequence = this.startSequence; this.show();
     let terminal: Terminal | null = null; let host: HTMLElement | null = null;
     try {
-      const session: Session = { id: 0, name: `${t('Consola')} ${this.sessions.length + 1}`, terminal: null!, fit: new FitAddon(), host: raw('div', 'terminal-instance'), exited: false };
+      const session: Session = { id: 0, name: name ?? `${t('Consola')} ${this.sessions.length + 1}`, terminal: null!, fit: new FitAddon(), host: raw('div', 'terminal-instance'), exited: false };
       session.terminal = terminal = new Terminal({ ...this.options(), allowProposedApi: false });
       session.host = host = raw('div', 'terminal-instance'); document.querySelector('#terminal-instances')!.append(host);
       terminal.loadAddon(session.fit); terminal.open(host);
@@ -77,6 +77,14 @@ export class TerminalPanel {
       this.sessions.push(session); this.activate(session);
     } catch (error) { terminal?.dispose(); host?.remove(); throw error; }
     finally { this.starting = false; }
+  }
+  /** Focuses the live console called `name`, or opens one that runs `command` (an agent CLI such as claude or codex). */
+  async agent(name: string, command: string) {
+    const session = this.sessions.find(s => s.name === name && !s.exited);
+    if (session) { this.activate(session); return false; }
+    await this.create(name);
+    if (this.active?.name === name) await call('terminal_write', { id: this.active.id, data: `${command}\r` });
+    return true;
   }
   /** Types a command into the active console, starting one if needed. */
   async run(command: string) {

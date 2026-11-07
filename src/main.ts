@@ -4,6 +4,8 @@ import './styles.css';
 import { call, desktop } from './api';
 import { Editor } from './editor';
 import { Explorer, SearchPanel } from './explorer';
+import { AgentPanel } from './agent-panel';
+import { DockerPanel } from './docker-panel';
 import { GitPanel } from './git-panel';
 import { getLocale, setLocale, t, type Locale } from './i18n';
 import { binaryPreview, renderPreview, textPreview } from './preview';
@@ -11,7 +13,7 @@ import { TerminalPanel } from './terminal';
 import { capture, renderSettings, type SettingsContext } from './settings-page';
 import { comboOf, defaultSettings, loadSettings, resolvedTheme, type Settings, type SettingValue } from './settings';
 import { basename, type Diff, type Workspace } from './types';
-import { ask, button, el, menu, quickPick, raw, report, separator, textButton, toast, type Icon, type MenuItem, type PickItem } from './ui';
+import { ask, button, el, icon, menu, quickPick, raw, report, separator, textButton, toast, type Icon, type MenuItem, type PickItem } from './ui';
 
 const store = {
   get<T>(key: string, fallback: T): T { try { return JSON.parse(localStorage.getItem(`lumen.${key}`) ?? 'null') ?? fallback; } catch { return fallback; } },
@@ -19,17 +21,17 @@ const store = {
 };
 
 document.querySelector('#app')!.innerHTML = `
-<header id="titlebar"><span class="brand">Lumen</span><nav id="menubar"></nav><span id="title-text"></span></header>
+<header id="titlebar" data-tauri-drag-region><span class="brand" data-tauri-drag-region>Lumen</span><nav id="menubar"></nav><span id="title-text" data-tauri-drag-region></span><div id="window-controls"></div></header>
 <div id="workbench">
   <nav id="activity" aria-label="Vistas"></nav>
   <aside id="sidebar">
     <div id="sidebar-header"><h2 id="sidebar-title"></h2><div id="sidebar-actions"></div></div>
-    <div id="explorer-content" class="view"></div><div id="search-content" class="view hidden"></div><div id="git-content" class="view hidden"></div>
+    <div id="explorer-content" class="view"></div><div id="search-content" class="view hidden"></div><div id="git-content" class="view hidden"></div><div id="docker-content" class="view hidden"></div>
   </aside>
   <div id="sidebar-sash" class="sash vertical"></div>
   <main id="main">
     <section id="editor-area">
-      <div id="tabs" role="tablist"></div>
+      <div id="tab-row"><div id="tabs" role="tablist"></div><div id="tab-actions"></div></div>
       <div id="welcome"></div>
       <div id="editor-surface" class="hidden">
         <div id="breadcrumbs"></div>
@@ -49,6 +51,8 @@ document.querySelector('#app')!.innerHTML = `
       <div id="terminal-content" class="panel-body"><div id="terminal-instances"></div><div id="terminal-empty"><button id="terminal-start" type="button" class="secondary"></button></div></div>
     </section>
   </main>
+  <div id="agent-sash" class="sash vertical hidden"></div>
+  <aside id="agent-panel" class="hidden" aria-label="Chat"></aside>
 </div>
 <footer id="statusbar"><div id="status-left"></div><div id="status-right"></div></footer>
 <div id="toasts" aria-live="polite"></div>`;
@@ -60,9 +64,9 @@ document.querySelector('#terminal-start')!.textContent = t('Iniciar terminal');
 let settings: Settings = { ...loadSettings(store.get<Record<string, SettingValue>>('settings', {})), locale: getLocale() };
 let workspace: Workspace | null = null;
 let recents = store.get<Workspace[]>('recents', []);
-let view: 'explorer' | 'search' | 'git' = 'explorer';
+let view: 'explorer' | 'search' | 'git' | 'docker' = 'explorer';
 let sidebarVisible = true;
-const editor = new Editor(settings), explorer = new Explorer(), search = new SearchPanel(), git = new GitPanel(), terminal = new TerminalPanel(settings);
+const editor = new Editor(settings), explorer = new Explorer(), search = new SearchPanel(), git = new GitPanel(), docker = new DockerPanel(), agents = new AgentPanel(), terminal = new TerminalPanel(settings);
 const requireFolder = () => { if (!workspace) { toast('Abre una carpeta primero', true); return false; } return true; };
 
 /* ---------- Files and workspace ---------- */
@@ -79,19 +83,39 @@ function persistSession() {
 async function openFolder(path?: string) {
   const target = path ?? await call<string | null>('pick_folder');
   if (!target || !await editor.closeAll()) return;
+  const remote = target.startsWith('ssh://');
+  if (remote) toast('Conectando por SSH…');
   try { await enter(await call<Workspace>('open_workspace', { path: target })); }
-  catch (error) { recents = recents.filter(r => r.path !== target); store.set('recents', recents); renderWelcome(); throw error; }
+  catch (error) {
+    // Without a key, ssh refuses in batch mode; ask once for the password and keep it only for this session.
+    if (remote && /Permission denied/i.test(String(error))) {
+      const password = await ask({ title: 'Contraseña SSH', detail: target.slice(6), password: true, confirm: 'Conectar' });
+      if (password) await enter(await call<Workspace>('open_workspace', { path: target, password }));
+      return;
+    }
+    // A remote machine can be offline for a while, so it stays in the recent list.
+    if (!remote) { recents = recents.filter(r => r.path !== target); store.set('recents', recents); renderWelcome(); }
+    throw error;
+  }
+}
+async function openRemote() {
+  const spec = await ask({ title: 'Carpeta remota (SSH)', detail: 'usuario@host:ruta. Usa tus claves y ~/.ssh/config; sin clave se pedirá la contraseña.', placeholder: 'pi@raspberrypi:/home/pi/proyecto' });
+  if (spec?.trim()) await openFolder(`ssh://${spec.trim()}`);
 }
 async function enter(info: Workspace) {
   workspace = info; recents = [info, ...recents.filter(r => r.path !== info.path)].slice(0, 10); store.set('recents', recents); store.set('last', info.path);
-  await explorer.reset(info.name); git.enabled = true; git.reset(); await git.refresh(true); terminal.reset(); renderWelcome(); updateStatus(); setView('explorer');
+  await explorer.reset(info.name); git.enabled = true; git.reset(); agents.reset(); await git.refresh(true); terminal.reset(); renderWelcome(); updateStatus(); setView('explorer');
   const session = settings.restoreSession ? store.get<{ files: string[]; active?: string }>(`session:${info.path}`, { files: [] }) : { files: [] as string[], active: undefined };
   for (const file of session.files) await editor.open(file).catch(() => {});
   if (session.active && session.files.includes(session.active)) await editor.open(session.active).catch(() => {});
 }
 async function closeFolder() {
   if (!await editor.closeAll()) return;
-  workspace = null; explorer.name = ''; explorer.render(); git.enabled = false; git.reset(); terminal.reset(); store.set('last', null); renderWelcome(); updateStatus();
+  await call('close_workspace').catch(() => {}); workspace = null; explorer.name = ''; explorer.render(); git.enabled = false; git.reset(); agents.reset(); terminal.reset(); store.set('last', null); renderWelcome(); updateStatus();
+}
+const remoteHost = () => workspace?.path.startsWith('ssh://') ? workspace.path.slice(6).split(':')[0] : '';
+async function disconnect() {
+  if (await ask({ title: '¿Cerrar la conexión SSH?', detail: remoteHost(), input: false, confirm: 'Desconectar' })) await closeFolder();
 }
 async function cloneRepository() {
   const url = await ask({ title: 'URL del repositorio', placeholder: 'https://github.com/…' }); if (!url?.trim()) return;
@@ -103,6 +127,14 @@ const absolute = (path: string) => { const root = workspace?.path ?? ''; const s
 async function openToSide(path: string) { editor.splitForOpen(); await openFile(path); }
 async function saveAs() { const doc = editor.active; if (!doc || doc.preview) return; await explorer.saveAs(doc.path, doc.model.getValue()); }
 const quit = () => getCurrentWindow().close();
+/* The native frame is off, so the window buttons live in the title bar. */
+if (desktop) {
+  const win = getCurrentWindow(), host = document.querySelector('#window-controls')!;
+  const maximize = button('Maximizar', () => win.toggleMaximize(), 'Square');
+  const sync = async () => { const max = await win.isMaximized(); maximize.replaceChildren(icon(max ? 'Copy' : 'Square')); maximize.title = t(max ? 'Restaurar' : 'Maximizar'); };
+  host.append(button('Minimizar', () => win.minimize(), 'Minus'), maximize, button('Cerrar', quit, 'X', 'window-close'));
+  void sync(); void win.onResized(() => void sync());
+}
 
 /* ---------- Tasks ---------- */
 const RUNNERS: Record<string, (file: string) => string> = { py: f => `python "${f}"`, js: f => `node "${f}"`, mjs: f => `node "${f}"`, ts: f => `npx tsx "${f}"`, rs: () => 'cargo run', go: f => `go run "${f}"`, sh: f => `bash "${f}"`, ps1: f => `powershell -ExecutionPolicy Bypass -File "${f}"`, bat: f => `.\\"${f}"`, cmd: f => `.\\"${f}"`, rb: f => `ruby "${f}"`, php: f => `php "${f}"`, lua: f => `lua "${f}"` };
@@ -111,6 +143,25 @@ async function runActiveFile() {
   const runner = RUNNERS[path.split('.').pop()?.toLowerCase() ?? '']; if (!runner) { toast('No se sabe cómo ejecutar este archivo', true); return; }
   await editor.saveAll(); await terminal.run(runner(path));
 }
+
+/* ---------- AI agents ---------- */
+// The official CLIs run in a terminal of their own: nothing is loaded until they are opened,
+// they keep their own login, and with an SSH folder they run on the remote machine.
+const AGENTS = { claude: { name: 'Claude', command: 'claude' }, codex: { name: 'Codex', command: 'codex' } } as const;
+type Agent = keyof typeof AGENTS;
+async function openAgent(agent: Agent) {
+  if (!requireFolder()) return;
+  if (await terminal.agent(AGENTS[agent].name, AGENTS[agent].command)) toast(`${AGENTS[agent].name}: si no arranca, instala su CLI (${AGENTS[agent].command}) y añádela al PATH`);
+}
+/** Puts a reference to the active file, and its selected lines, into the chat prompt. */
+async function sendToAgent(agent: Agent) {
+  const doc = editor.active; if (!doc || doc.preview || !requireFolder()) return;
+  const selection = editor.current.getSelection();
+  const lines = selection && !selection.isEmpty() ? [selection.startLineNumber, selection.endLineNumber - (selection.endColumn === 1 && selection.endLineNumber > selection.startLineNumber ? 1 : 0)] : null;
+  const reference = agent === 'claude' ? `@${doc.path}${lines ? `#L${lines[0]}-${lines[1]}` : ''} ` : `${doc.path}${lines ? `:${lines[0]}-${lines[1]}` : ''} `;
+  await editor.saveAll(); agents.insert(agent, reference);
+}
+for (const agent of Object.keys(AGENTS) as Agent[]) monaco.editor.addEditorAction({ id: `lumen.send.${agent}`, label: `${t('Enviar a')} ${AGENTS[agent].name}`, contextMenuGroupId: '9_agents', run: () => sendToAgent(agent).catch(report) });
 async function detectTasks() {
   const tasks: { label: string; command: string }[] = [];
   const read = (path: string) => call<string>('read_file', { path }).catch(() => null);
@@ -145,6 +196,7 @@ const commands: Command[] = [
   { id: 'newFile', label: 'Nuevo archivo…', keys: 'Ctrl+N', run: () => requireFolder() && explorer.create(false) },
   { id: 'newFolder', label: 'Nueva carpeta', run: () => requireFolder() && explorer.create(true) },
   { id: 'openFolder', label: 'Abrir carpeta…', keys: 'Ctrl+O', run: () => openFolder() },
+  { id: 'openRemote', label: 'Abrir carpeta remota (SSH)…', run: openRemote },
   { id: 'recent', label: 'Abrir reciente…', keys: 'Ctrl+R', run: () => quickPick('Proyectos recientes', recents.map(r => ({ label: r.name, detail: r.path, run: () => openFolder(r.path) }))) },
   { id: 'clone', label: 'Clonar repositorio…', run: cloneRepository },
   { id: 'save', label: 'Guardar', keys: 'Ctrl+S', run: () => editor.save() },
@@ -171,6 +223,7 @@ const commands: Command[] = [
   { id: 'explorer', label: 'Explorador', keys: 'Ctrl+Shift+E', run: () => setView('explorer') },
   { id: 'search', label: 'Buscar', run: () => setView('search') },
   { id: 'scm', label: 'Control de versiones', keys: 'Ctrl+Shift+G', run: () => setView('git') },
+  { id: 'docker', label: 'Docker', run: () => setView('docker') },
   { id: 'problems', label: 'Mostrar problemas', keys: 'Ctrl+Shift+M', run: () => terminal.show('problems') },
   { id: 'output', label: 'Mostrar salida', keys: 'Ctrl+Shift+U', run: () => terminal.show('output') },
   { id: 'terminal', label: 'Mostrar u ocultar terminal', keys: 'Ctrl+J', run: () => terminal.toggle() },
@@ -192,6 +245,12 @@ const commands: Command[] = [
   { id: 'closeTerminal', label: 'Cerrar terminal activa', run: () => terminal.closeActive() },
   { id: 'runTask', label: 'Ejecutar tarea…', keys: 'Ctrl+Shift+B', run: runTask },
   { id: 'runFile', label: 'Ejecutar archivo activo', keys: 'F5', run: runActiveFile },
+  { id: 'chatClaude', label: 'Chat con Claude', run: () => agents.open('claude') },
+  { id: 'chatCodex', label: 'Chat con Codex', run: () => agents.open('codex') },
+  { id: 'claude', label: 'Claude Code en terminal', run: () => openAgent('claude') },
+  { id: 'codex', label: 'Codex en terminal', run: () => openAgent('codex') },
+  { id: 'sendClaude', label: 'Enviar selección a Claude', run: () => sendToAgent('claude') },
+  { id: 'sendCodex', label: 'Enviar selección a Codex', run: () => sendToAgent('codex') },
   { id: 'gitMerge', label: 'Fusionar rama (merge)…', run: () => git.pickBranch(branch => git.action('merge', branch), 'Rama que quieres fusionar') },
   { id: 'gitBranch', label: 'Cambiar de rama…', run: () => git.pickBranch() },
   { id: 'gitHistory', label: 'Historial', run: () => { setView('git'); return git.history(); } },
@@ -210,12 +269,12 @@ for (const [id, keys] of Object.entries(keybindings)) { const found = commands.f
 const item = (id: string, label?: string): MenuItem => { const c = command(id); return { label: label ?? c.label, shortcut: c.keys, action: c.run }; };
 const items = (...ids: string[]): MenuItem[] => ids.map(id => id === '-' ? separator : item(id));
 const MENUS: [string, () => MenuItem[]][] = [
-  ['Archivo', () => items('newFile', 'newFolder', '-', 'openFolder', 'recent', 'clone', '-', 'save', 'saveAs', 'saveAll', 'autoSave', 'reload', '-', 'closeFile', 'closeAll', 'closeFolder', '-', 'settings', 'quit')],
+  ['Archivo', () => items('newFile', 'newFolder', '-', 'openFolder', 'openRemote', 'recent', 'clone', '-', 'save', 'saveAs', 'saveAll', 'autoSave', 'reload', '-', 'closeFile', 'closeAll', 'closeFolder', '-', 'settings', 'quit')],
   ['Editar', () => items('undo', 'redo', '-', 'cut', 'copy', 'paste', '-', 'find', 'replace', 'findFiles', 'replaceFiles', '-', 'format', 'comment')],
   ['Selección', () => items('selectAll', 'expand', 'shrink', '-', 'cursorUp', 'cursorDown', 'nextMatch', 'allMatches', '-', 'duplicate', 'lineUp', 'lineDown')],
-  ['Ver', () => items('palette', '-', 'explorer', 'search', 'scm', 'problems', 'output', 'terminal', '-', 'sidebar', 'split', 'wrap', 'minimap', 'blame', 'preview', '-', 'zoomIn', 'zoomOut', 'zoomReset', 'fullscreen')],
+  ['Ver', () => items('palette', '-', 'explorer', 'search', 'scm', 'docker', 'problems', 'output', 'terminal', '-', 'sidebar', 'split', 'wrap', 'minimap', 'blame', 'preview', '-', 'zoomIn', 'zoomOut', 'zoomReset', 'fullscreen')],
   ['Ir', () => items('goFile', 'goLine', 'goSymbol', 'goDefinition', 'goReferences', 'rename', '-', 'nextProblem', 'prevProblem', '-', 'nextTab', 'prevTab')],
-  ['Terminal', () => items('newTerminal', 'clearTerminal', 'closeTerminal', '-', 'runTask', 'runFile')],
+  ['Terminal', () => items('newTerminal', 'clearTerminal', 'closeTerminal', '-', 'runTask', 'runFile', '-', 'chatClaude', 'chatCodex', 'sendClaude', 'sendCodex', 'claude', 'codex')],
   ['Ayuda', () => items('palette', 'shortcuts', '-', 'about')],
 ];
 for (const [label, build] of MENUS) { const node = textButton(label, () => menu(node, build())); document.querySelector('#menubar')!.append(node); }
@@ -239,14 +298,16 @@ async function compareHead(path: string) { editor.showDiff(await call<Diff>('git
 async function showShortcuts() { await openSettings(); }
 
 /* ---------- Layout ---------- */
-const VIEWS = { explorer: ['Explorador', '#explorer-content', 'Files'], search: ['Buscar', '#search-content', 'Search'], git: ['Control de versiones', '#git-content', 'GitBranch'] } as const;
-function toggleSidebar() { sidebarVisible = !sidebarVisible; document.querySelector('#sidebar')!.classList.toggle('hidden', !sidebarVisible); document.querySelector('#sidebar-sash')!.classList.toggle('hidden', !sidebarVisible); renderActivity(); }
+const VIEWS = { explorer: ['Explorador', '#explorer-content', 'Files'], search: ['Buscar', '#search-content', 'Search'], git: ['Control de versiones', '#git-content', 'GitBranch'], docker: ['Docker', '#docker-content', 'Container'] } as const;
+function toggleSidebar() { sidebarVisible = !sidebarVisible; document.querySelector('#sidebar')!.classList.toggle('hidden', !sidebarVisible); document.querySelector('#sidebar-sash')!.classList.toggle('hidden', !sidebarVisible); docker.show(sidebarVisible && view === 'docker'); renderActivity(); }
 function setView(next: typeof view) {
   view = next; if (!sidebarVisible) toggleSidebar();
   for (const [id, [, selector]] of Object.entries(VIEWS)) document.querySelector(selector)!.classList.toggle('hidden', id !== next);
   document.querySelector('#sidebar-title')!.textContent = t(VIEWS[next][0]);
   const actions = document.querySelector('#sidebar-actions')!; actions.replaceChildren();
   if (next === 'explorer') actions.append(button('Nuevo archivo', () => command('newFile').run(), 'FilePlus2'), button('Nueva carpeta', () => command('newFolder').run(), 'FolderPlus'), button('Actualizar', () => explorer.refresh(), 'RefreshCw'), button('Contraer todo', () => explorer.collapseAll(), 'ChevronsDownUp'));
+  if (next === 'docker') actions.append(button('Actualizar', () => docker.refresh(), 'RefreshCw'));
+  docker.show(next === 'docker');
   if (next === 'git') { const more = button('Más acciones de Git', () => git.more(more), 'MoreHorizontal'); actions.append(button('Actualizar', () => git.refresh(true), 'RefreshCw'), more); }
   renderActivity();
 }
@@ -268,18 +329,21 @@ function sash(id: string, axis: 'x' | 'y', apply: (value: number) => void) {
   });
 }
 function setSize(name: string, value: number) { document.documentElement.style.setProperty(`--${name}`, `${value}px`); store.set(name, value); }
-setSize('sidebar-width', store.get('sidebar-width', 280)); setSize('panel-height', store.get('panel-height', 280));
+setSize('sidebar-width', store.get('sidebar-width', 280)); setSize('agent-width', store.get('agent-width', 420));
+sash('#agent-sash', 'x', x => setSize('agent-width', Math.min(window.innerWidth - 400, Math.max(280, window.innerWidth - x))));
+document.querySelector('#tab-actions')!.append(textButton('Claude', () => agents.toggle('claude'), 'Sparkles', 'tab-agent'), textButton('Codex', () => agents.toggle('codex'), 'Sparkles', 'tab-agent')); setSize('panel-height', store.get('panel-height', 280));
 sash('#sidebar-sash', 'x', x => setSize('sidebar-width', Math.min(window.innerWidth - 300, Math.max(170, settings.sidebarPosition === 'right' ? window.innerWidth - x : x - (settings.showActivityBar ? 48 : 0)))));
 sash('#pane-sash', 'x', x => { const box = document.querySelector('#editor-panes')!.getBoundingClientRect(); document.documentElement.style.setProperty('--split', `${Math.min(85, Math.max(15, (x - box.left) / box.width * 100))}%`); });
 sash('#panel-sash', 'y', y => setSize('panel-height', Math.min(window.innerHeight - 180, Math.max(90, window.innerHeight - y - 24))));
 
 /* ---------- Status bar, welcome, problems ---------- */
-function statusItem(host: Element, text: string, action?: () => unknown, glyph?: Icon, title = '') {
-  const node = button(title || text, action ?? (() => {}), glyph, 'status-item'); node.append(raw('span', '', text)); host.append(node);
+function statusItem(host: Element, text: string, action?: () => unknown, glyph?: Icon, title = '', className = '') {
+  const node = button(title || text, action ?? (() => {}), glyph, `status-item ${className}`); node.append(raw('span', '', text)); host.append(node);
 }
 let cursor = { line: 1, column: 1 }, blameText = '';
 function updateStatus() {
   const left = document.querySelector('#status-left')!, right = document.querySelector('#status-right')!; left.replaceChildren(); right.replaceChildren();
+  if (remoteHost()) statusItem(left, `SSH: ${remoteHost()}`, disconnect, 'Server', 'Conectado por SSH. Pulsa para desconectar', 'status-remote');
   if (git.status) { statusItem(left, git.status.branch + (git.status.changes.length ? '*' : ''), () => git.pickBranch(), 'GitBranch'); statusItem(left, `↑${git.status.ahead} ↓${git.status.behind}`, () => git.sync(), 'RefreshCw', 'Sync'); }
   else statusItem(left, workspace?.name ?? t('Sin carpeta'), () => command('openFolder').run(), 'Folder');
   const markers = monaco.editor.getModelMarkers({}); const count = (severity: monaco.MarkerSeverity) => markers.filter(m => m.severity === severity).length;
@@ -290,14 +354,14 @@ function updateStatus() {
     statusItem(right, `${t('Espacios')}: ${editor.indent()}`, pickIndent); statusItem(right, 'UTF-8'); statusItem(right, editor.eol(), () => editor.toggleEol()); statusItem(right, editor.languageName(), pickLanguage);
   }
   statusItem(right, t(desktop ? 'Listo' : 'Vista previa web'));
-  const name = editor.activeTitle(); const title = [name, workspace?.name, 'Lumen'].filter(Boolean).join(' — ');
+  const name = editor.activeTitle(); const title = [name, workspace && remoteHost() ? `${workspace.name} [SSH: ${remoteHost()}]` : workspace?.name, 'Lumen'].filter(Boolean).join(' — ');
   document.title = title; document.querySelector('#title-text')!.textContent = title;
   if (desktop) void getCurrentWindow().setTitle(title).catch(() => {});
 }
 function renderWelcome() {
   const host = document.querySelector('#welcome')!; host.replaceChildren();
   const hero = raw('div', 'hero'); hero.append(el('h1', '', 'Un espacio para tu código.'), el('p', 'muted', 'Editor preciso. Git integrado. Una terminal de verdad.'));
-  const start = raw('div', 'welcome-col'); start.append(el('h3', '', 'EMPEZAR'), textButton('Abrir carpeta…', () => openFolder(), 'FolderOpen'), textButton('Clonar repositorio…', cloneRepository, 'GitFork'), textButton('Paleta de comandos', () => openPalette('>'), 'Search'));
+  const start = raw('div', 'welcome-col'); start.append(el('h3', '', 'EMPEZAR'), textButton('Abrir carpeta…', () => openFolder(), 'FolderOpen'), textButton('Abrir carpeta remota (SSH)…', openRemote, 'Server'), textButton('Clonar repositorio…', cloneRepository, 'GitFork'), textButton('Paleta de comandos', () => openPalette('>'), 'Search'));
   const recent = raw('div', 'welcome-col'); recent.append(el('h3', '', 'RECIENTES'));
   if (!recents.length) recent.append(el('p', 'muted', 'Todavía no has abierto ningún proyecto.'));
   for (const entry of recents.slice(0, 6)) { const row = button(entry.path, () => openFolder(entry.path), 'Folder', 'recent-row'); row.append(raw('span', '', entry.name), raw('small', '', entry.path)); recent.append(row); }
@@ -374,6 +438,9 @@ search.afterReplace = async () => { await editor.syncDisk(); await git.refresh()
 git.onDiff = (diff, path) => editor.showDiff(diff, path);
 git.onOpen = path => openFile(path);
 git.onOutput = text => terminal.log(text);
+docker.onOutput = text => { terminal.log(text); terminal.show('output'); };
+docker.onRun = command => terminal.run(command);
+agents.onChanged = () => { void editor.syncDisk(); void explorer.refresh().catch(() => {}); void git.refresh(); };
 git.onChanged = () => { void editor.syncDisk(); void explorer.refresh(); editor.refreshGutters(); };
 git.onUpdate = () => {
   const statuses = new Map((settings.explorerGitStatus ? git.status?.changes ?? [] : []).map(c => [c.path, c.conflict ? 'U' : c.worktree === '?' ? 'A' : c.worktree !== ' ' ? c.worktree : c.index]));

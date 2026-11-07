@@ -1,14 +1,19 @@
-use crate::workspace::{self, Result};
+use crate::workspace::{self, Result, Root};
 use serde::Serialize;
 use std::{path::Path, process::{Command, Output}};
 
-fn process(root: &Path, args: &[&str]) -> Result<Output> {
+const ENV: [&str; 4] = ["env", "GIT_TERMINAL_PROMPT=0", "GIT_EDITOR=true", "GIT_OPTIONAL_LOCKS=0"];
+fn process(root: &Root, args: &[&str]) -> Result<Output> {
+    let root = match root {
+        Root::Local(root) => root,
+        Root::Remote(remote) => return remote.run(&[&ENV[..], &["git", "--no-pager", "-c", "color.ui=false"], args].concat()),
+    };
     let mut command = Command::new("git");
     command.current_dir(root).args(["--no-pager", "-c", "color.ui=false"]).args(args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_EDITOR", "true").env("GIT_OPTIONAL_LOCKS", "0");
     #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
     command.output().map_err(|e| format!("No se puede ejecutar Git. Instálalo y añádelo al PATH: {e}"))
 }
-pub fn run(root: &Path, args: &[&str]) -> Result<String> {
+pub fn run(root: &Root, args: &[&str]) -> Result<String> {
     let result = process(root, args)?;
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr).trim().to_owned();
@@ -18,10 +23,13 @@ pub fn run(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&result.stdout).into())
 }
 
-fn repository(root: &Path) -> Result<()> {
+fn repository(root: &Root) -> Result<()> {
     let top = run(root, &["rev-parse", "--show-toplevel"])?;
-    let canonical = Path::new(top.trim()).canonicalize().map_err(|e| e.to_string())?;
-    if canonical != root { return Err(format!("Abre la raíz del repositorio para usar Git: {}", top.trim())); }
+    let inside = match root {
+        Root::Local(root) => Path::new(top.trim()).canonicalize().map_err(|e| e.to_string())? == *root,
+        Root::Remote(remote) => top.trim() == remote.root,
+    };
+    if !inside { return Err(format!("Abre la raíz del repositorio para usar Git: {}", top.trim())); }
     Ok(())
 }
 
@@ -45,22 +53,22 @@ pub fn parse_status(data: &str) -> Vec<Change> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status { pub branch: String, pub upstream: Option<String>, pub ahead: u32, pub behind: u32, pub changes: Vec<Change>, pub merging: bool, pub rebasing: bool, pub cherry_picking: bool }
-pub fn status(root: &Path) -> Result<Status> {
+pub fn status(root: &Root) -> Result<Status> {
     repository(root)?;
     let branch = run(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| run(root, &["rev-parse", "--short", "HEAD"]).unwrap_or("HEAD".into()));
     let upstream = run(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).ok().map(|s| s.trim().to_owned());
     let counts = run(root, &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]).unwrap_or_default();
     let mut counts = counts.split_whitespace().map(|v| v.parse::<u32>().unwrap_or(0));
-    let git_path = |name: &str| run(root, &["rev-parse", "--git-path", name]).ok().is_some_and(|p| root.join(p.trim()).exists());
+    let git_path = |name: &str| run(root, &["rev-parse", "--git-path", name]).ok().is_some_and(|p| root.git_file_exists(p.trim()));
     Ok(Status { branch: branch.trim().into(), upstream, ahead: counts.next().unwrap_or(0), behind: counts.next().unwrap_or(0), changes: parse_status(&run(root, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?), merging: git_path("MERGE_HEAD"), rebasing: git_path("rebase-merge") || git_path("rebase-apply"), cherry_picking: git_path("CHERRY_PICK_HEAD") })
 }
 
 #[derive(Serialize)]
 pub struct Commit { pub hash: String, pub short: String, pub author: String, pub date: String, pub subject: String, pub refs: String, pub parents: Vec<String> }
-pub fn log(root: &Path, path: Option<&str>) -> Result<Vec<Commit>> {
+pub fn log(root: &Root, path: Option<&str>) -> Result<Vec<Commit>> {
     repository(root)?;
     let mut args = vec!["log", "-300", "--topo-order", "--date=short", "--format=%H%x00%h%x00%an%x00%ad%x00%s%x00%D%x00%P%x00"];
-    if let Some(path) = path { workspace::resolve(root, path, false)?; args.extend(["--follow", "--", path]); }
+    if let Some(path) = path { root.check(path, false)?; args.extend(["--follow", "--", path]); }
     let text = match run(root, &args) { Ok(text) => text, Err(_) if !process(root, &["rev-parse", "--verify", "HEAD"])?.status.success() => return Ok(vec![]), Err(e) => return Err(e) };
     let parts: Vec<&str> = text.split('\0').collect();
     Ok(parts.chunks(7).filter(|p| p.len() == 7).map(|p| Commit { hash: p[0].trim().into(), short: p[1].into(), author: p[2].into(), date: p[3].into(), subject: p[4].into(), refs: p[5].into(), parents: p[6].split_whitespace().map(str::to_owned).collect() }).collect())
@@ -69,7 +77,7 @@ pub fn log(root: &Path, path: Option<&str>) -> Result<Vec<Commit>> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Branch { pub name: String, pub current: bool, pub remote: bool }
-pub fn branches(root: &Path) -> Result<Vec<Branch>> {
+pub fn branches(root: &Root) -> Result<Vec<Branch>> {
     repository(root)?;
     Ok(run(root, &["for-each-ref", "--format=%(HEAD)%00%(refname:short)%00%(refname)", "refs/heads", "refs/remotes"])?
         .lines().filter_map(|line| { let p: Vec<_> = line.split('\0').collect(); (p.len() == 3 && !p[1].ends_with("/HEAD")).then(|| Branch { current: p[0] == "*", name: p[1].into(), remote: p[2].starts_with("refs/remotes/") }) }).collect())
@@ -77,17 +85,17 @@ pub fn branches(root: &Path) -> Result<Vec<Branch>> {
 
 #[derive(Serialize)]
 pub struct Diff { pub original: String, pub modified: String, pub title: String }
-pub fn diff(root: &Path, path: &str, staged: bool, old_path: Option<&str>) -> Result<Diff> {
+pub fn diff(root: &Root, path: &str, staged: bool, old_path: Option<&str>) -> Result<Diff> {
     repository(root)?;
-    workspace::resolve(root, path, false)?;
-    let old = old_path.unwrap_or(path); workspace::resolve(root, old, false)?;
+    root.check(path, false)?;
+    let old = old_path.unwrap_or(path); root.check(old, false)?;
     let original_spec = if staged { format!("HEAD:{old}") } else { format!(":{path}") };
     let original = blob(root, &original_spec)?;
-    let modified = if staged { blob(root, &format!(":{path}"))? } else if root.join(path).exists() { workspace::read(root, path)? } else { String::new() };
+    let modified = if staged { blob(root, &format!(":{path}"))? } else if root.exists(path) { root.read(path)? } else { String::new() };
     Ok(Diff { original, modified, title: format!("{} · {}", path, if staged { "Preparado" } else { "Cambios" }) })
 }
 
-fn blob(root: &Path, spec: &str) -> Result<String> {
+fn blob(root: &Root, spec: &str) -> Result<String> {
     if !process(root, &["cat-file", "-e", spec])?.status.success() { return Ok(String::new()); }
     let size = run(root, &["cat-file", "-s", spec])?.trim().parse::<u64>().map_err(|e| e.to_string())?;
     if size > workspace::MAX_FILE { return Err("La diferencia supera los 5 MB".into()); }
@@ -105,9 +113,9 @@ fn pair(value: &str) -> Result<(&str, &str)> {
     valid_ref(first)?; valid_ref(second)?; Ok((first, second))
 }
 
-pub fn action(root: &Path, action: &str, value: &str, paths: &[String]) -> Result<String> {
+pub fn action(root: &Root, action: &str, value: &str, paths: &[String]) -> Result<String> {
     if action != "init" { repository(root)?; }
-    for path in paths { workspace::resolve(root, path, false)?; }
+    for path in paths { root.check(path, false)?; }
     match action {
         "init" => run(root, &["init", "-b", "main"]),
         "stage" | "unstage" => {
@@ -126,7 +134,7 @@ pub fn action(root: &Path, action: &str, value: &str, paths: &[String]) -> Resul
             let mut args = vec!["restore", "--"]; args.extend(paths.iter().map(String::as_str)); run(root, &args)
         }
         // Untracked files have no Git copy, so they go to the recoverable system trash.
-        "clean" => { for path in paths { trash::delete(workspace::resolve(root, path, true)?).map_err(|e| e.to_string())?; } Ok(String::new()) }
+        "clean" => { for path in paths { root.trash(path)?; } Ok(String::new()) }
         "fetch" => run(root, &["fetch", "--all", "--prune"]),
         "pull" => run(root, &["pull", "--ff-only"]),
         "pull-rebase" => run(root, &["pull", "--rebase"]),
@@ -173,14 +181,14 @@ fn valid_hash(hash: &str) -> Result<()> {
 
 #[derive(Serialize)]
 pub struct CommitFile { pub status: String, pub path: String }
-pub fn commit_files(root: &Path, hash: &str) -> Result<Vec<CommitFile>> {
+pub fn commit_files(root: &Root, hash: &str) -> Result<Vec<CommitFile>> {
     repository(root)?; valid_hash(hash)?;
     let text = run(root, &["diff-tree", "-r", "--root", "-m", "--first-parent", "--no-commit-id", "--name-status", "-z", hash])?;
     let parts: Vec<&str> = text.split('\0').collect();
     Ok(parts.chunks(2).filter(|p| p.len() == 2).map(|p| CommitFile { status: p[0].trim().into(), path: p[1].into() }).collect())
 }
-pub fn commit_diff(root: &Path, hash: &str, path: &str) -> Result<Diff> {
-    repository(root)?; valid_hash(hash)?; workspace::resolve(root, path, false)?;
+pub fn commit_diff(root: &Root, hash: &str, path: &str) -> Result<Diff> {
+    repository(root)?; valid_hash(hash)?; root.check(path, false)?;
     Ok(Diff { original: blob(root, &format!("{hash}^:{path}"))?, modified: blob(root, &format!("{hash}:{path}"))?, title: format!("{} · {}", path, &hash[..7]) })
 }
 
@@ -195,15 +203,15 @@ pub fn parse_hunks(diff: &str) -> Vec<LineChange> {
         Some(match (removed, added) { (0, _) => LineChange { start, count: added, kind: 'A' }, (_, 0) => LineChange { start: start.max(1), count: 1, kind: 'D' }, _ => LineChange { start, count: added, kind: 'M' } })
     }).collect()
 }
-pub fn line_changes(root: &Path, path: &str) -> Result<Vec<LineChange>> {
-    repository(root)?; workspace::resolve(root, path, false)?;
+pub fn line_changes(root: &Root, path: &str) -> Result<Vec<LineChange>> {
+    repository(root)?; root.check(path, false)?;
     Ok(parse_hunks(&run(root, &["diff", "-U0", "--no-ext-diff", "HEAD", "--", path])?))
 }
 
 #[derive(Serialize)]
 pub struct Blame { pub hash: String, pub author: String, pub time: u64, pub summary: String }
-pub fn blame(root: &Path, path: &str, line: u32) -> Result<Option<Blame>> {
-    repository(root)?; workspace::resolve(root, path, true)?;
+pub fn blame(root: &Root, path: &str, line: u32) -> Result<Option<Blame>> {
+    repository(root)?; root.check(path, true)?;
     let text = run(root, &["blame", "--porcelain", "-L", &format!("{line},{line}"), "--", path])?;
     let hash = text.split_whitespace().next().unwrap_or("").to_owned();
     if hash.bytes().all(|c| c == b'0') { return Ok(None); }
@@ -211,7 +219,7 @@ pub fn blame(root: &Path, path: &str, line: u32) -> Result<Option<Blame>> {
     Ok(Some(Blame { hash, author: field("author "), time: field("author-time ").parse().unwrap_or(0), summary: field("summary ") }))
 }
 
-pub fn list(root: &Path, kind: &str) -> Result<Vec<String>> {
+pub fn list(root: &Root, kind: &str) -> Result<Vec<String>> {
     repository(root)?;
     let text = match kind {
         "tags" => run(root, &["for-each-ref", "--format=%(refname:short)", "refs/tags"])?,
@@ -222,11 +230,20 @@ pub fn list(root: &Path, kind: &str) -> Result<Vec<String>> {
     Ok(text.lines().map(str::to_owned).collect())
 }
 
-pub fn commit_detail(root: &Path, hash: &str) -> Result<String> {
+pub fn commit_detail(root: &Root, hash: &str) -> Result<String> {
     repository(root)?;
     valid_hash(hash)?;
     // Cap the patch in the subprocess so enormous commits cannot fill the editor.
     use std::io::Read;
+    const SHOW: [&str; 6] = ["show", "--format=fuller", "--stat", "--patch", "--no-ext-diff", "--no-textconv"];
+    let root = match root {
+        Root::Local(root) => root,
+        Root::Remote(remote) => {
+            let bytes = remote.run_limited(&[&ENV[..], &["git", "--no-pager"], &SHOW[..], &[hash]].concat(), workspace::MAX_FILE + 1)?;
+            if bytes.len() as u64 > workspace::MAX_FILE { return Err("Este commit es demasiado grande para mostrarlo (5 MB)".into()); }
+            return Ok(String::from_utf8_lossy(&bytes).into());
+        }
+    };
     let mut command = Command::new("git");
     command.current_dir(root).args(["--no-pager", "show", "--format=fuller", "--stat", "--patch", "--no-ext-diff", "--no-textconv", hash]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
     #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
@@ -250,15 +267,15 @@ mod tests {
     }
     #[test]
     fn git_lifecycle_and_staged_diff() {
-        let dir = tempfile::tempdir().unwrap(); let root = dir.path().canonicalize().unwrap();
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().canonicalize().unwrap(); let root = Root::Local(path.clone());
         action(&root, "init", "", &[]).unwrap();
         run(&root, &["config", "user.name", "Lumen test"]).unwrap(); run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
-        std::fs::write(root.join("file.txt"), "initial\n").unwrap();
+        std::fs::write(path.join("file.txt"), "initial\n").unwrap();
         assert_eq!(status(&root).unwrap().changes.len(), 1);
         action(&root, "stage", "", &["file.txt".into()]).unwrap();
         assert_eq!(diff(&root, "file.txt", true, None).unwrap().original, "");
         action(&root, "commit", "Initial", &[]).unwrap();
-        std::fs::write(root.join("file.txt"), "modified\n").unwrap();
+        std::fs::write(path.join("file.txt"), "modified\n").unwrap();
         let d = diff(&root, "file.txt", false, None).unwrap(); assert_eq!(d.original, "initial\n"); assert_eq!(d.modified, "modified\n");
         action(&root, "stage", "", &["file.txt".into()]).unwrap(); action(&root, "unstage", "", &["file.txt".into()]).unwrap();
         assert_eq!(status(&root).unwrap().changes[0].worktree, 'M');
@@ -273,16 +290,16 @@ mod tests {
     }
     #[test]
     fn full_version_control_flow() {
-        let dir = tempfile::tempdir().unwrap(); let root = dir.path().canonicalize().unwrap();
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().canonicalize().unwrap(); let root = Root::Local(path.clone());
         action(&root, "init", "", &[]).unwrap();
         run(&root, &["config", "user.name", "Lumen test"]).unwrap(); run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
-        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
         action(&root, "commit-all", "First", &[]).unwrap();
-        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        std::fs::write(path.join("a.txt"), "two\n").unwrap();
         assert_eq!(line_changes(&root, "a.txt").unwrap()[0].kind, 'M');
         action(&root, "discard", "", &["a.txt".into()]).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap().trim(), "one");
-        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        assert_eq!(std::fs::read_to_string(path.join("a.txt")).unwrap().trim(), "one");
+        std::fs::write(path.join("b.txt"), "b\n").unwrap();
         action(&root, "stash", "wip", &[]).unwrap();
         assert_eq!(list(&root, "stashes").unwrap().len(), 1);
         action(&root, "stash-pop", "stash@{0}", &[]).unwrap();

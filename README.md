@@ -2,7 +2,7 @@
 
 A lightweight desktop IDE built with Rust and Tauri. It pairs the Monaco editor with a real terminal and a complete Git workflow, in an 8 MB executable.
 
-[Leer en español](README.es.md) · [Download for Windows](https://github.com/u0f/lumen-ide/releases/latest)
+[Leer en español](README.es.md) · [Download for Windows and Ubuntu](https://github.com/u0f/lumen-ide/releases/latest)
 
 ![Lumen with two files open side by side](docs/screenshot.png)
 
@@ -27,6 +27,22 @@ A lightweight desktop IDE built with Rust and Tauri. It pairs the Monaco editor 
 **Terminal**
 - Real PTY sessions with a configurable shell
 - Task runner for `package.json`, Cargo, Go, Makefile and `.vscode/tasks.json`
+
+**Remote folders (SSH)**
+- Open a folder on another machine (`user@host:path`) and edit it as if it were local
+- One persistent connection through the system `ssh`: uses your keys and `~/.ssh/config`, or asks for the password once; nothing is installed on the remote side
+- Explorer, search, Git, terminal and Docker all run on the remote machine
+- The status bar shows the connection; click it to disconnect
+
+**Docker**
+- Containers view below Source control, refreshed only while it is visible
+- Right click to start, stop, pause, restart, view or follow logs, open a shell and remove
+
+**AI agents**
+- Chat panel for Claude Code and Codex, opened from the buttons next to the tabs
+- Previous chats, new chat, and read-only, edit or full-access permissions
+- Right click in the editor to send the selected lines to the chat
+- Runs the official CLIs with your own account; nothing stays running between messages
 
 **Settings**
 - 116 options in a dedicated tab, with search and per-setting reset
@@ -78,6 +94,8 @@ src/                 TypeScript frontend
   editor.ts          Monaco, tabs, split panes, diffs, blame
   explorer.ts        File tree and search panel
   git-panel.ts       Source control view
+  docker-panel.ts    Containers view
+  agent-panel.ts     Claude and Codex chat
   terminal.ts        Terminal, output and problems panel
   preview.ts         File previews
   settings.ts        Settings schema
@@ -86,6 +104,9 @@ src/                 TypeScript frontend
 src-tauri/           Rust backend
   src/workspace.rs   Sandboxed file access and search
   src/git.rs         Git operations
+  src/remote.rs      Remote folders over SSH
+  src/docker.rs      Docker CLI
+  src/agent.rs       Claude and Codex CLIs and their chat history
   src/terminal.rs    PTY sessions
   src/lib.rs         Tauri commands
 e2e/app.mjs          End-to-end test of the real app
@@ -109,9 +130,9 @@ npm run test:e2e
 
 ## Not included
 
-Debugger, VS Code extensions, external language servers, multi-root workspaces, remote development and non-UTF-8 encodings. Languages other than TS/JS, HTML, CSS and JSON get syntax highlighting and word-based completion only, and TS/JS reports syntax errors but not type errors.
+Debugger, VS Code extensions, external language servers, multi-root workspaces and non-UTF-8 encodings. Languages other than TS/JS, HTML, CSS and JSON get syntax highlighting and word-based completion only, and TS/JS reports syntax errors but not type errors.
 
-Linux support is checked by CI builds; the end-to-end suite does not cover it.
+Linux support is checked by CI builds, which also produce the `.deb` package; the end-to-end suite does not cover it. Remote folders need GNU `find`, `grep -P` and `base64` on the remote machine (standard on Debian, Ubuntu and Raspberry Pi OS). The chat needs the `claude` or `codex` CLI installed and signed in.
 
 ## License
 

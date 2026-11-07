@@ -1,21 +1,58 @@
 use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use regex::RegexBuilder;
 use serde::Serialize;
-use std::{fs, io::Write, path::{Component, Path, PathBuf}, sync::Mutex};
+use crate::remote::Remote;
+use std::{fs, io::Write, path::{Component, Path, PathBuf}, sync::{Arc, Mutex}};
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_FILE: u64 = 5 * 1024 * 1024;
+pub const MAX_BINARY: u64 = 64 * 1024 * 1024;
 #[derive(Default)]
-pub struct Workspace(pub Mutex<Option<PathBuf>>);
+pub struct Workspace(pub Mutex<Option<Root>>);
 
 impl Workspace {
-    pub fn root(&self) -> Result<PathBuf> {
+    pub fn root(&self) -> Result<Root> {
         self.0.lock().map_err(|e| e.to_string())?.clone().ok_or("Abre una carpeta primero".into())
+    }
+    pub fn remote(&self) -> Option<Arc<Remote>> {
+        match self.0.lock().ok()?.as_ref()? { Root::Remote(remote) => Some(remote.clone()), Root::Local(_) => None }
     }
 }
 
-// Canonicalize the existing parent too: lexical checks alone allow symlink escapes.
-pub fn resolve(root: &Path, relative: &str, must_exist: bool) -> Result<PathBuf> {
+/// The open folder: on this machine or on another one through SSH.
+#[derive(Clone)]
+pub enum Root { Local(PathBuf), Remote(Arc<Remote>) }
+impl Root {
+    pub fn check(&self, path: &str, must_exist: bool) -> Result<()> { match self { Root::Local(root) => resolve(root, path, must_exist).map(|_| ()), Root::Remote(_) => lexical(path) } }
+    pub fn exists(&self, path: &str) -> bool { match self { Root::Local(root) => root.join(path).exists(), Root::Remote(remote) => remote.exists(path) } }
+    /// For paths Git reports itself (inside .git), which the user-facing rules reject.
+    pub fn git_file_exists(&self, path: &str) -> bool { match self { Root::Local(root) => root.join(path).exists(), Root::Remote(remote) => remote.test_exists(path) } }
+    pub fn list(&self, path: &str) -> Result<Vec<Entry>> { match self { Root::Local(root) => list(root, path), Root::Remote(remote) => remote.list(path) } }
+    pub fn files(&self) -> Result<Vec<String>> { match self { Root::Local(root) => Ok(files(root)), Root::Remote(remote) => remote.files() } }
+    pub fn read(&self, path: &str) -> Result<String> { match self { Root::Local(root) => read(root, path), Root::Remote(remote) => remote.read(path) } }
+    pub fn save(&self, path: &str, content: &str, expected: &str) -> Result<()> { match self { Root::Local(root) => save(root, path, content, expected), Root::Remote(remote) => remote.save(path, content, expected) } }
+    pub fn create(&self, path: &str, directory: bool) -> Result<()> { match self { Root::Local(root) => create(root, path, directory), Root::Remote(remote) => remote.create(path, directory) } }
+    pub fn rename(&self, from: &str, to: &str) -> Result<()> { match self { Root::Local(root) => rename(root, from, to), Root::Remote(remote) => remote.rename(from, to) } }
+    pub fn search(&self, query: &Query) -> Result<SearchResults> { match self { Root::Local(root) => search(root, query), Root::Remote(remote) => remote.search(query) } }
+    pub fn replace(&self, query: &Query, replacement: &str) -> Result<usize> { match self { Root::Local(root) => replace(root, query, replacement), Root::Remote(remote) => remote.replace(query, replacement) } }
+    pub fn trash(&self, path: &str) -> Result<()> {
+        match self { Root::Local(root) => trash::delete(resolve(root, path, true)?).map_err(|e| e.to_string()), Root::Remote(remote) => remote.trash(path) }
+    }
+    /// Reads up to `limit` bytes (64 MB at most); without a limit, larger files are an error.
+    pub fn read_binary(&self, path: &str, limit: Option<u64>) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let max = limit.unwrap_or(MAX_BINARY).min(MAX_BINARY);
+        let mut bytes = match self {
+            Root::Local(root) => { let mut bytes = Vec::new(); fs::File::open(resolve(root, path, true)?).map_err(|e| e.to_string())?.take(max + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?; bytes }
+            Root::Remote(remote) => remote.read_bytes(path, max)?,
+        };
+        if limit.is_none() && bytes.len() as u64 > max { return Err("La vista previa admite archivos de hasta 64 MB".into()); }
+        bytes.truncate(max as usize); Ok(bytes)
+    }
+}
+
+/// Path rules shared by local and remote folders: relative, no parent jumps, never inside .git.
+pub fn lexical(relative: &str) -> Result<()> {
     let path = Path::new(relative);
     if path.is_absolute() || path.components().any(|c| !matches!(c, Component::Normal(_))) {
         return Err("La ruta debe estar dentro de la carpeta abierta".into());
@@ -23,7 +60,13 @@ pub fn resolve(root: &Path, relative: &str, must_exist: bool) -> Result<PathBuf>
     if path.components().any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(".git")) {
         return Err("La carpeta interna .git está protegida".into());
     }
-    let joined = root.join(path);
+    Ok(())
+}
+
+// Canonicalize the existing parent too: lexical checks alone allow symlink escapes.
+pub fn resolve(root: &Path, relative: &str, must_exist: bool) -> Result<PathBuf> {
+    lexical(relative)?;
+    let joined = root.join(relative);
     let checked = if must_exist { joined.canonicalize() } else {
         let mut ancestor = joined.as_path(); let mut suffix = Vec::new();
         while !ancestor.exists() { suffix.push(ancestor.file_name().ok_or("Ruta inválida")?.to_owned()); ancestor = ancestor.parent().ok_or("Ruta inválida")?; }
@@ -53,7 +96,7 @@ pub fn set_workspace(state: &Workspace, path: PathBuf) -> Result<WorkspaceInfo> 
         name: root.file_name().unwrap_or_default().to_string_lossy().into(),
         path: display_path(&root),
     };
-    *state.0.lock().map_err(|e| e.to_string())? = Some(root);
+    *state.0.lock().map_err(|e| e.to_string())? = Some(Root::Local(root));
     Ok(info)
 }
 
@@ -138,10 +181,12 @@ pub struct SearchResults { pub matches: Vec<Match>, pub truncated: bool }
 #[serde(rename_all = "camelCase")]
 pub struct Query { pub query: String, pub case_sensitive: bool, pub regex: bool, pub whole_word: bool, pub include: String }
 impl Query {
-    fn matcher(&self) -> Result<regex::Regex> {
+    pub(crate) fn pattern(&self) -> String {
         let pattern = if self.regex { self.query.clone() } else { regex::escape(&self.query) };
-        let pattern = if self.whole_word { format!(r"\b(?:{pattern})\b") } else { pattern };
-        RegexBuilder::new(&pattern).case_insensitive(!self.case_sensitive).size_limit(1024 * 1024).build().map_err(|e| e.to_string())
+        if self.whole_word { format!(r"\b(?:{pattern})\b") } else { pattern }
+    }
+    pub(crate) fn matcher(&self) -> Result<regex::Regex> {
+        RegexBuilder::new(&self.pattern()).case_insensitive(!self.case_sensitive).size_limit(1024 * 1024).build().map_err(|e| e.to_string())
     }
 }
 fn text_files(root: &Path, include: &str) -> Result<impl Iterator<Item = (String, String)>> {
@@ -167,14 +212,19 @@ pub fn search(root: &Path, query: &Query) -> Result<SearchResults> {
     Ok(SearchResults { matches, truncated: false })
 }
 
+/// Applies a replacement to one text; None when nothing matches.
+pub(crate) fn replaced(matcher: &regex::Regex, query: &Query, text: &str, replacement: &str) -> Option<(String, usize)> {
+    let found = matcher.find_iter(text).count();
+    if found == 0 { return None; }
+    Some((if query.regex { matcher.replace_all(text, replacement) } else { matcher.replace_all(text, regex::NoExpand(replacement)) }.into_owned(), found))
+}
+
 pub fn replace(root: &Path, query: &Query, replacement: &str) -> Result<usize> {
     if query.query.is_empty() { return Ok(0); }
     let matcher = query.matcher()?;
     let mut count = 0;
     for (path, text) in text_files(root, &query.include)? {
-        let found = matcher.find_iter(&text).count();
-        if found == 0 { continue; }
-        let updated = if query.regex { matcher.replace_all(&text, replacement) } else { matcher.replace_all(&text, regex::NoExpand(replacement)) };
+        let Some((updated, found)) = replaced(&matcher, query, &text, replacement) else { continue };
         save(root, &path, &updated, &text)?;
         count += found;
     }

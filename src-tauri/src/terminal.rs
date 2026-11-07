@@ -1,7 +1,7 @@
 use crate::workspace::Result;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use std::{collections::HashMap, io::{Read, Write}, path::Path, sync::{Arc, Mutex}, sync::atomic::{AtomicU32, Ordering}};
+use std::{collections::HashMap, io::{Read, Write}, sync::{Arc, Mutex}, sync::atomic::{AtomicU32, Ordering}};
 use tauri::ipc::Channel;
 
 pub struct Session { master: Box<dyn MasterPty + Send>, writer: Box<dyn Write + Send>, killer: Box<dyn ChildKiller + Send + Sync> }
@@ -13,17 +13,27 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum TerminalEvent { Data { data: Vec<u8> }, Exit { code: u32 } }
 
-pub fn start(root: &Path, terminals: &Terminals, channel: Channel<TerminalEvent>, shell: Option<String>) -> Result<u32> {
+pub fn start(root: &crate::workspace::Root, terminals: &Terminals, channel: Channel<TerminalEvent>, shell: Option<String>) -> Result<u32> {
     let mut sessions = terminals.0.lock().map_err(|e| e.to_string())?;
     if sessions.len() >= 8 { return Err("Máximo de 8 terminales simultáneas".into()); }
     let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 100, pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())?;
     #[cfg(windows)] let default = "powershell.exe -NoLogo".to_owned();
     #[cfg(not(windows))] let default = std::env::var("SHELL").unwrap_or("/bin/sh".into());
-    let line = shell.filter(|s| !s.trim().is_empty()).unwrap_or(default);
-    let mut parts = line.split_whitespace();
-    let mut command = CommandBuilder::new(parts.next().ok_or("Consola inválida")?);
-    command.args(parts);
-    command.cwd(crate::workspace::display_path(root)); command.env("TERM", "xterm-256color"); command.env("COLORTERM", "truecolor");
+    let mut command = match root {
+        crate::workspace::Root::Local(root) => {
+            let line = shell.filter(|s| !s.trim().is_empty()).unwrap_or(default);
+            let mut parts = line.split_whitespace();
+            let mut command = CommandBuilder::new(parts.next().ok_or("Consola inválida")?);
+            command.args(parts); command.cwd(crate::workspace::display_path(root)); command
+        }
+        // Remote folders open a shell on the remote machine, in the project folder.
+        crate::workspace::Root::Remote(remote) => {
+            let (args, environment) = remote.terminal();
+            let mut command = CommandBuilder::new("ssh"); command.args(args);
+            for (key, value) in environment { command.env(key, value); }
+            command
+        }
+    }; command.env("TERM", "xterm-256color"); command.env("COLORTERM", "truecolor");
     let mut child = pair.slave.spawn_command(command).map_err(|e| e.to_string())?;
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
