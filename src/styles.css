@@ -170,6 +170,9 @@ kbd { font: 11px 'Cascadia Mono', Consolas, monospace; color: var(--muted); marg
 .change-name .icon { width: 14px; height: 14px; color: var(--muted); }
 .change-name span { overflow: hidden; text-overflow: ellipsis; flex: none; max-width: 75%; }
 .change-name small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.change-row.tree .change-name span { flex: 0 1 auto; max-width: none; }
+.change-row.tree .change-name .tree-spacer { flex: none; width: 14px; }
+.change-row.tree .count { flex: none; color: var(--muted); font-size: 11px; padding: 0 4px; }
 .git-status { font-size: 11px; font-weight: 700; width: 16px; text-align: center; flex: none; }
 .row-action { display: none; padding: 2px; flex: none; }
 .row-action .icon { width: 14px; height: 14px; }

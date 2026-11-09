@@ -28,6 +28,25 @@ function graph(commits: Commit[]) {
   });
 }
 
+interface TreeNode { name: string; path: string; dirs: Map<string, TreeNode>; files: Change[] }
+const changedPaths = (items: Change[]) => [...new Set(items.flatMap(c => c.oldPath ? [c.path, c.oldPath] : [c.path]))];
+function tree(changes: Change[]) {
+  const root: TreeNode = { name: '', path: '', dirs: new Map(), files: [] };
+  for (const change of changes) {
+    const parts = change.path.split('/'); parts.pop(); let node = root;
+    for (const part of parts) { let next = node.dirs.get(part); if (!next) { next = { name: part, path: node.path ? `${node.path}/${part}` : part, dirs: new Map(), files: [] }; node.dirs.set(part, next); } node = next; }
+    node.files.push(change);
+  }
+  return root;
+}
+/** Folds chains of single-child folders into one row (`src/app/ui`), as VS Code does. */
+function compact(node: TreeNode): TreeNode {
+  if (node.files.length || node.dirs.size !== 1) return node;
+  const [child] = node.dirs.values();
+  return compact({ ...child, name: `${node.name}/${child.name}` });
+}
+function allChanges(node: TreeNode): Change[] { return [...node.files, ...[...node.dirs.values()].flatMap(allChanges)]; }
+
 export class GitPanel {
   status: GitStatus | null = null;
   enabled = false;
@@ -37,6 +56,8 @@ export class GitPanel {
   view: 'changes' | 'history' | 'branches' = 'changes';
   smartCommit = 'prompt';
   pullMode = 'pull';
+  private tree = (() => { try { return localStorage.getItem('lumen.scmTree') === '1'; } catch { return false; } })();
+  private collapsed = new Set<string>();
   private refreshing = false;
   private revision = 0;
   onDiff: (diff: Diff, path: string) => void = () => {};
@@ -110,24 +131,48 @@ export class GitPanel {
     { label: 'Commit y push', action: async () => { await this.commit(); await this.action('push'); } },
     { label: 'Commit y sync', action: async () => { await this.commit(); await this.sync(); } },
   ]; }
+  private setTree(value: boolean) { this.tree = value; try { localStorage.setItem('lumen.scmTree', value ? '1' : '0'); } catch { /* optional */ } this.render(); }
   async sync() { await this.action(this.pullMode); await this.action('push'); }
   group(host: Element, title: string, changes: Change[], staged: boolean, conflict = false) {
     const header = raw('div', 'section-heading'); header.append(el('span', '', title), raw('span', 'count', String(changes.length)));
-    const paths = (items: Change[]) => [...new Set(items.flatMap(c => c.oldPath ? [c.path, c.oldPath] : [c.path]))];
+    header.append(button(this.tree ? 'Ver como lista' : 'Ver como árbol', () => this.setTree(!this.tree), this.tree ? 'List' : 'ListTree'));
     if (changes.length && !conflict) {
       if (!staged) header.append(button('Descartar todos los cambios', () => this.discard(changes), 'Undo2'));
-      header.append(button(staged ? 'Quitar todos de preparados' : 'Preparar todos', () => this.action(staged ? 'unstage' : 'stage', '', paths(changes)), staged ? 'Minus' : 'Plus'));
+      header.append(button(staged ? 'Quitar todos de preparados' : 'Preparar todos', () => this.action(staged ? 'unstage' : 'stage', '', changedPaths(changes)), staged ? 'Minus' : 'Plus'));
     }
     host.append(header);
-    for (const change of changes) {
-      const row = raw('div', 'change-row');
-      const open = button(change.path, async () => { if (conflict) await this.onOpen(change.path); else this.onDiff(await call<Diff>('git_diff', { path: change.path, staged, oldPath: change.oldPath }), change.path); }, undefined, 'change-name');
-      open.append(icon(conflict ? 'GitCompareArrows' : 'FileCode2'), raw('span', '', basename(change.path)), raw('small', '', change.path.includes('/') ? change.path.slice(0, change.path.lastIndexOf('/')) : ''));
-      row.append(open, raw('span', `git-status status-${conflict ? 'U' : staged ? change.index : change.worktree === '?' ? 'A' : change.worktree}`, conflict ? '!' : staged ? change.index : change.worktree === '?' ? 'U' : change.worktree));
-      if (change.worktree !== 'D') row.append(button('Abrir archivo para editar', () => this.onOpen(change.path), 'FileCode2', 'row-action'));
-      if (!staged && !conflict) row.append(button('Descartar cambios', () => this.discard([change]), 'Undo2', 'row-action'));
-      row.append(button(staged ? 'Quitar de preparados' : conflict ? 'Marcar como resuelto' : 'Preparar archivo', () => this.action(staged ? 'unstage' : 'stage', '', paths([change])), staged ? 'Minus' : 'Plus', 'row-action')); host.append(row);
+    if (this.tree) this.renderTree(host, title, tree(changes), staged, conflict, 0);
+    else for (const change of changes) host.append(this.row(change, staged, conflict));
+  }
+  private renderTree(host: Element, group: string, node: TreeNode, staged: boolean, conflict: boolean, depth: number) {
+    for (const child of [...node.dirs.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+      const dir = compact(child), key = `${group}:${dir.path}`, collapsed = this.collapsed.has(key), items = allChanges(dir);
+      const row = raw('div', 'change-row tree');
+      const open = button(dir.path, () => { if (collapsed) this.collapsed.delete(key); else this.collapsed.add(key); this.render(); }, undefined, 'change-name');
+      open.style.paddingLeft = `${12 + depth * 12}px`; open.setAttribute('aria-expanded', String(!collapsed));
+      open.append(icon(collapsed ? 'ChevronRight' : 'ChevronDown'), icon(collapsed ? 'Folder' : 'FolderOpen'), raw('span', '', dir.name));
+      row.append(open, raw('span', 'count', String(items.length)));
+      if (!conflict) {
+        if (!staged) row.append(button('Descartar todos los cambios', () => this.discard(items), 'Undo2', 'row-action'));
+        row.append(button(staged ? 'Quitar todos de preparados' : 'Preparar todos', () => this.action(staged ? 'unstage' : 'stage', '', changedPaths(items)), staged ? 'Minus' : 'Plus', 'row-action'));
+      }
+      host.append(row);
+      if (!collapsed) this.renderTree(host, group, dir, staged, conflict, depth + 1);
     }
+    for (const change of [...node.files].sort((a, b) => basename(a.path).localeCompare(basename(b.path)))) host.append(this.row(change, staged, conflict, depth));
+  }
+  /** Builds a file row; `depth` is set in tree mode, where the folder is implied by the nesting. */
+  private row(change: Change, staged: boolean, conflict: boolean, depth?: number) {
+    const row = raw('div', depth === undefined ? 'change-row' : 'change-row tree');
+    const open = button(change.path, async () => { if (conflict) await this.onOpen(change.path); else this.onDiff(await call<Diff>('git_diff', { path: change.path, staged, oldPath: change.oldPath }), change.path); }, undefined, 'change-name');
+    if (depth !== undefined) { open.style.paddingLeft = `${12 + depth * 12}px`; open.append(raw('span', 'tree-spacer')); }
+    open.append(icon(conflict ? 'GitCompareArrows' : 'FileCode2'), raw('span', '', basename(change.path)));
+    if (depth === undefined) open.append(raw('small', '', change.path.includes('/') ? change.path.slice(0, change.path.lastIndexOf('/')) : ''));
+    row.append(open, raw('span', `git-status status-${conflict ? 'U' : staged ? change.index : change.worktree === '?' ? 'A' : change.worktree}`, conflict ? '!' : staged ? change.index : change.worktree === '?' ? 'U' : change.worktree));
+    if (change.worktree !== 'D') row.append(button('Abrir archivo para editar', () => this.onOpen(change.path), 'FileCode2', 'row-action'));
+    if (!staged && !conflict) row.append(button('Descartar cambios', () => this.discard([change]), 'Undo2', 'row-action'));
+    row.append(button(staged ? 'Quitar de preparados' : conflict ? 'Marcar como resuelto' : 'Preparar archivo', () => this.action(staged ? 'unstage' : 'stage', '', changedPaths([change])), staged ? 'Minus' : 'Plus', 'row-action'));
+    return row;
   }
   async discard(changes: Change[]) {
     const untracked = changes.filter(c => c.index === '?').map(c => c.path), tracked = changes.filter(c => c.index !== '?').map(c => c.path);
